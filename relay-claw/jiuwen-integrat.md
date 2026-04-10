@@ -197,3 +197,156 @@ CAT_CAFE_MCP_COMMAND                 →   CAT_CAFE_MCP_COMMAND
 ```
 
 ---
+
+## jiuwenclaw 作为 Sidecar 拉起的完整流程
+
+### 1. 架构概览
+
+```
+RelayClawAgentService (Node.js API 层)
+    ↓
+DefaultRelayClawSidecarController (Sidecar 控制器)
+    ↓
+spawn() → Python 子进程
+    ↓
+jiuwenclaw/.venv/Scripts/python.exe -m jiuwenclaw.app
+```
+
+---
+
+### 2. 启动入口
+
+**`RelayClawAgentService.invoke()`** (`RelayClawAgentService.ts:115-159`)
+
+```typescript
+const runtime = this.getOrCreateScopeRuntime(scope);
+await this.ensureConnected(runtime, signal, options);
+```
+
+调用 `sidecar.ensureStarted()` 启动 sidecar。
+
+---
+
+### 3. Sidecar 控制逻辑
+
+**`DefaultRelayClawSidecarController.ensureStarted()`** (`relayclaw-sidecar.ts:78-107`)
+
+1. 构建 runtime 配置 (`buildRuntime`)
+2. 计算 runtimeHash 检查是否需要重启
+3. 调用 `start()` 启动进程
+
+---
+
+### 4. Python Bin 选择逻辑
+
+**`resolveJiuwenClawPythonBin()`** (`jiuwenclaw-paths.ts:35-67`)
+
+```typescript
+// 优先级顺序:
+1. 显式配置 (CAT_CAFE_RELAYCLAW_PYTHON 环境变量或 config.pythonBin)
+2. vendor/jiuwenclaw/.venv/Scripts/python.exe  ← 实际选中
+3. tools/python/python.exe (bundled Python)
+4. legacy path (/usr/code/relay-claw/.venv)
+```
+
+**实际选中路径：**
+```
+D:\project\gaotong\relay-claw\vendor\jiuwenclaw\.venv\Scripts\python.exe
+```
+
+---
+
+### 5. 启动命令
+
+**`buildRelayClawLaunchCommand()`** (`relayclaw-sidecar.ts:336-350`)
+
+```typescript
+if (runtime.useExecutable) {
+    // 打包后的 exe
+    return { command: executablePath, args: ['--desktop-run-app'] };
+}
+// 源码模式（当前使用）
+return {
+    command: pythonBin,    // .venv/Scripts/python.exe
+    args: ['-m', 'jiuwenclaw.app'],
+    cwd: appDir,           // vendor/jiuwenclaw/
+};
+```
+
+---
+
+### 6. 环境变量注入
+
+**`buildRuntime()`** (`relayclaw-sidecar.ts:137-203`)
+
+关键环境变量：
+| 变量 | 来源 |
+|------|------|
+| `API_KEY` | callbackEnv |
+| `API_BASE` | callbackEnv |
+| `MODEL_NAME` | config.modelName |
+| `HOME` | `.cat-cafe/relayclaw/{catId}` |
+| `AGENT_PORT` | 动态分配 |
+| `WEB_PORT` | 动态分配 |
+| `JIUWENCLAW_PROJECT_DIR` | workingDirectory |
+
+Windows 平台还会注入：
+```typescript
+spawnEnv.PYTHONIOENCODING = 'utf-8';
+spawnEnv.PYTHONUTF8 = '1';
+// prepend bundled Python to PATH
+withBundledPythonPath(spawnEnv, ...)
+```
+
+---
+
+### 7. 就绪检测
+
+**`isRelayClawRuntimeReady()`** (`relayclaw-sidecar.ts:352-369`)
+
+等待条件：
+1. TCP probe agentPort 成功
+2. 日志包含 `[JiuWenClaw] 初始化完成` 或 `WebChannel 已启动`
+3. 或 TCP probe webPort 成功
+
+超时默认 180 秒 (`startupTimeoutMs`)
+
+---
+
+### 8. 为什么是 uv 环境
+
+`vendor/jiuwenclaw/.venv` 由 uv 创建（`pyvenv.cfg` 显示 `uv = 0.11.3`）。
+
+该 venv 的 stdlib 指向 uv 的基础 Python：
+```
+C:\Users\HW\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\
+```
+
+该目录存在 `EXTERNALLY-MANAGED` 文件，导致 pip 检测到 externally-managed-environment。
+
+---
+
+### 9. 调用时序图
+
+```
+用户请求 → RelayClawAgentService.invoke()
+              ↓
+         resolveScope() → 按 API_KEY/API_BASE/MODEL_NAME 计算 scopeHash
+              ↓
+         getOrCreateScopeRuntime() → 创建 SidecarController
+              ↓
+         ensureConnected()
+              ↓
+         sidecar.ensureStarted()
+              ↓
+         buildRuntime() → 解析 pythonBin, appDir, 环境变量
+              ↓
+         spawn(python, ['-m', 'jiuwenclaw.app'], {cwd: appDir, env: spawnEnv})
+              ↓
+         等待 TCP probe + 日志初始化标记
+              ↓
+         WebSocket 连接建立 → 开始对话
+```
+
+---
+
